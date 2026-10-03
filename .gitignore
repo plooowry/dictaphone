@@ -1,0 +1,4 @@
+.build/
+Dictaphone.app/
+dist/
+.DS_Store
