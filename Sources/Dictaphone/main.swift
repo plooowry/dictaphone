@@ -27,9 +27,6 @@ struct Turn: Codable {
 struct MeetingInfo: Codable {
     var title: String
     var duration: Double
-    var summary: String?
-    var actionItems: [String] = []
-    var note: String?
 }
 
 func clock(_ seconds: Double) -> String {
@@ -55,19 +52,10 @@ struct Transcript: Identifiable, Codable {
         return turns.map { "\(name($0.speaker)): \($0.text)" }.joined(separator: "\n")
     }
 
-    /// What read-back says: for meetings, the title, summary and action items; otherwise the transcript.
-    var spokenText: String {
-        guard let m = meeting, let s = m.summary else { return displayText }
-        var out = "\(m.title). \(s)"
-        if !m.actionItems.isEmpty { out += " Action items: " + m.actionItems.joined(separator: ". ") + "." }
-        return out
-    }
-
+    /// Markdown export: meetings get a header and timestamped lines; other transcripts are plain text.
     var markdown: String {
         guard let m = meeting else { return displayText }
         var out = "# \(m.title)\n\n*\(date.formatted(date: .long, time: .shortened)) · \(clock(m.duration)) · \(speakerCount) speaker\(speakerCount == 1 ? "" : "s")*\n\n"
-        if let s = m.summary { out += "## Summary\n\n\(s)\n\n" }
-        if !m.actionItems.isEmpty { out += "## Action items\n\n" + m.actionItems.map { "- [ ] \($0)" }.joined(separator: "\n") + "\n\n" }
         out += "## Transcript\n\n"
         out += (turns ?? []).map { "**[\(clock(Double($0.start ?? 0)))] \(name($0.speaker)):** \($0.text)" }.joined(separator: "\n\n")
         return out
@@ -79,10 +67,11 @@ final class Store: ObservableObject {
     @Published var status = "Loading model…"
     @Published var spinning = false
     @Published var recording = false
-    @Published var summarizing: Set<UUID> = []
+    var onTestSystemAudio: () -> Void = {}
     @Published var voiceID: String { didSet { UserDefaults.standard.set(voiceID, forKey: "voiceID") } }
     @Published var speed: Double { didSet { UserDefaults.standard.set(speed, forKey: "speed") } }
     @Published var autoRead: Bool { didSet { UserDefaults.standard.set(autoRead, forKey: "autoRead") } }
+    @Published var captureMode: String { didSet { UserDefaults.standard.set(captureMode, forKey: "captureMode") } }
     @Published var detectSpeakers: Bool { didSet { UserDefaults.standard.set(detectSpeakers, forKey: "detectSpeakers") } }
 
     private let fileURL: URL = {
@@ -98,6 +87,7 @@ final class Store: ObservableObject {
         speed = d.object(forKey: "speed") as? Double ?? 1.0
         autoRead = d.bool(forKey: "autoRead")
         detectSpeakers = d.bool(forKey: "detectSpeakers")
+        captureMode = d.string(forKey: "captureMode") ?? CaptureMode.both.rawValue
         if let data = try? Data(contentsOf: fileURL),
            let saved = try? JSONDecoder().decode([Transcript].self, from: data) { items = saved }
     }
@@ -111,18 +101,8 @@ final class Store: ObservableObject {
         save()
     }
 
-    func applySummary(_ id: UUID, _ r: SummaryResult) {
-        guard let i = items.firstIndex(where: { $0.id == id }), var m = items[i].meeting else { return }
-        if let t = r.title { m.title = t }
-        m.summary = r.summary
-        m.actionItems = r.actionItems
-        m.note = r.note
-        items[i].meeting = m
-        save()
-    }
-
-    func add(_ text: String, turns: [Turn]? = nil, meeting: MeetingInfo? = nil) -> Transcript {
-        let t = Transcript(date: Date(), text: text, turns: turns, meeting: meeting)
+    func add(_ text: String, turns: [Turn]? = nil, meeting: MeetingInfo? = nil, names: [String: String]? = nil) -> Transcript {
+        let t = Transcript(date: Date(), text: text, turns: turns, names: names, meeting: meeting)
         items.insert(t, at: 0)
         save()
         return t
@@ -178,7 +158,7 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, AV
             speakNeural(t, voice: String(store.voiceID.dropFirst(Speaker.kokoroPrefix.count)))
             return
         }
-        let u = AVSpeechUtterance(string: t.spokenText)
+        let u = AVSpeechUtterance(string: t.displayText)
         u.voice = store.voiceID.isEmpty ? nil : AVSpeechSynthesisVoice(identifier: store.voiceID)
         u.rate = min(max(AVSpeechUtteranceDefaultSpeechRate * Float(store.speed),
                          AVSpeechUtteranceMinimumSpeechRate), AVSpeechUtteranceMaximumSpeechRate)
@@ -215,7 +195,7 @@ final class Speaker: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, AV
                     try await m.initialize()
                     self.kokoro = m
                 }
-                let wav = try await self.kokoro!.synthesize(text: t.spokenText, voice: voice, speed: speed)
+                let wav = try await self.kokoro!.synthesize(text: t.displayText, voice: voice, speed: speed)
                 await MainActor.run {
                     guard gen == self.generation else { return }
                     self.store.spinning = false
@@ -414,7 +394,7 @@ struct CardView: View {
                 Spacer()
                 Button { speaking ? speaker.stop() : speaker.speak([t]) } label: {
                     Image(systemName: speaking ? "stop.fill" : "play.fill")
-                }.help(speaking ? "Stop" : (t.meeting?.summary != nil ? "Read summary aloud" : "Read aloud"))
+                }.help(speaking ? "Stop" : "Read aloud")
                 Button {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(t.markdown, forType: .string)
@@ -431,10 +411,12 @@ struct CardView: View {
 
             if let m = t.meeting {
                 meetingBody(m)
-            } else if let turns = t.turns, !speaking {
-                turnsView(turns, showTime: false)
             } else {
-                Text(highlighted).textSelection(.enabled).font(.body)
+                if let turns = t.turns, !speaking {
+                    turnsView(turns, showTime: false)
+                } else {
+                    Text(highlighted).textSelection(.enabled).font(.body)
+                }
             }
         }
         .padding(12)
@@ -450,20 +432,6 @@ struct CardView: View {
     @ViewBuilder func meetingBody(_ m: MeetingInfo) -> some View {
         Text("\(t.date.formatted(date: .abbreviated, time: .shortened)) · \(clock(m.duration)) · \(t.speakerCount) speaker\(t.speakerCount == 1 ? "" : "s")")
             .font(.caption).foregroundStyle(.secondary)
-        if store.summarizing.contains(t.id) {
-            HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Writing summary…").foregroundStyle(.secondary) }
-        }
-        if let s = m.summary {
-            Text("Summary").font(.subheadline.bold())
-            Text(s).textSelection(.enabled)
-        }
-        if !m.actionItems.isEmpty {
-            Text("Action items").font(.subheadline.bold()).padding(.top, 2)
-            ForEach(Array(m.actionItems.enumerated()), id: \.offset) { _, item in
-                Label { Text(item).textSelection(.enabled) } icon: { Image(systemName: "circle").foregroundStyle(.secondary) }
-            }
-        }
-        if let n = m.note { Text(n).font(.caption).foregroundStyle(.orange) }
         DisclosureGroup("Full transcript", isExpanded: $showTranscript) {
             turnsView(t.turns ?? [], showTime: true).padding(.top, 6)
         }
@@ -548,6 +516,17 @@ struct ContentView: View {
                     Text(String(format: "%.1fx", store.speed)).monospacedDigit().frame(width: 36)
                 }
                 HStack {
+                    Text("Meeting audio").foregroundStyle(.secondary)
+                    Picker("Meeting audio", selection: $store.captureMode) {
+                        Text("Mic").tag("mic"); Text("System").tag("system"); Text("Mic + System").tag("both")
+                    }.pickerStyle(.segmented).labelsHidden().frame(width: 240)
+                    Button("Test system audio") { store.onTestSystemAudio() }
+                        .buttonStyle(.borderless).font(.caption)
+                        .help("Records 4 seconds of whatever your Mac is playing and reports whether it was heard.")
+                        .help("Mic = you and the room. System = Teams/Zoom/browser audio. Needs Screen & System Audio Recording permission.")
+                    Spacer()
+                }
+                HStack {
                     Toggle("Auto-read after transcribing", isOn: $store.autoRead)
                     Toggle("Detect speakers", isOn: $store.detectSpeakers)
                         .help("Labels who is talking (Person 1, Person 2…). Slower; first use downloads ~100 MB.")
@@ -590,12 +569,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var busy = false
     var meetingMode = false
+    var recordingActive = false
+    var starting = false
+    var startTime = Date()
+    var micStart = Date()
+    var capture = CaptureMode.mic
+    var sysRecorder: SystemAudioRecorder?
+    var sysURL = FileManager.default.temporaryDirectory.appendingPathComponent("meeting-system.wav")
     var timer: Timer?
     var activity: NSObjectProtocol?
     var fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("dictaphone.wav")
 
     func applicationDidFinishLaunching(_ n: Notification) {
         setIcon("mic", "Loading model…")
+        store.onTestSystemAudio = { [weak self] in self?.testSystemAudio() }
         models.onNeuralRemoved = { [weak self] in self?.speaker.unloadNeural() }
         models.onSpeakerRemoved = { [weak self] in self?.diarizer = nil }
         buildWindow()
@@ -603,6 +590,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerHotKeys()
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
         showWindow()
+        if CommandLine.arguments.contains("--test-system-audio") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.testSystemAudio() }
+        }
         Task {
             do {
                 whisper = try await WhisperKit(WhisperKitConfig(model: "base.en"))
@@ -680,48 +670,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Recording
     @objc func toggle() {
-        if recorder?.isRecording == true { stopAndTranscribe() } else { start(meeting: false) }
+        if recordingActive { stopAndTranscribe() } else { start(meeting: false) }
     }
 
     @objc func toggleMeeting() {
-        if recorder?.isRecording == true { stopAndTranscribe() } else { start(meeting: true) }
+        if recordingActive { stopAndTranscribe() } else { start(meeting: true) }
     }
 
     func start(meeting: Bool) {
-        guard !busy, whisper != nil else { log("start blocked busy=\(busy) model=\(whisper != nil)"); NSSound.beep(); return }
+        guard !busy, !starting, whisper != nil else { log("start blocked busy=\(busy) model=\(whisper != nil)"); NSSound.beep(); return }
         speaker.stop()
         meetingMode = meeting
-        fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(meeting ? "meeting.wav" : "dictaphone.wav")
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000,
-            AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16,
-        ]
+        let mode = meeting ? (CaptureMode(rawValue: store.captureMode) ?? .both) : .mic
+        let tmp = FileManager.default.temporaryDirectory
+        fileURL = tmp.appendingPathComponent(meeting ? "meeting.wav" : "dictaphone.wav")
+        sysURL = tmp.appendingPathComponent("meeting-system.wav")
+        starting = true
+        Task {
+            var usedMode = mode
+            var warning: String?
+            if mode != .mic {
+                let rec = SystemAudioRecorder()
+                do {
+                    try await rec.start(to: sysURL)
+                    sysRecorder = rec
+                } catch {
+                    log("system audio failed: \(error)")
+                    usedMode = .mic
+                    warning = "System audio unavailable — allow Dictaphone in Privacy & Security → Screen & System Audio Recording, then relaunch. Recording mic only."
+                    if !CGPreflightScreenCaptureAccess() {
+                        CGRequestScreenCaptureAccess()
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                    }
+                }
+            }
+            let m = usedMode, w = warning
+            await MainActor.run { self.beginRecording(meeting: meeting, mode: m, warning: w) }
+        }
+    }
+
+    func beginRecording(meeting: Bool, mode: CaptureMode, warning: String?) {
+        starting = false
+        capture = mode
         do {
-            recorder = try AVAudioRecorder(url: fileURL, settings: settings)
-            guard recorder!.record() else { throw NSError(domain: "Dictaphone", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Microphone unavailable — check permissions"]) }
+            if mode != .system {
+                let settings: [String: Any] = [
+                    AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000,
+                    AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16,
+                ]
+                recorder = try AVAudioRecorder(url: fileURL, settings: settings)
+                guard recorder!.record() else { throw NSError(domain: "Dictaphone", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Microphone unavailable — check permissions"]) }
+            }
+            micStart = Date(); startTime = micStart
+            recordingActive = true
             setIcon("record.circle.fill", "Recording…")
             statusItem.button?.contentTintColor = .systemRed
             store.recording = true
-            store.status = meeting ? "Recording meeting… 00:00 — press ⇧⌘D to stop" : "Recording… press ⌘D to stop"
+            let sources = mode == .both ? "mic + system audio" : (mode == .system ? "system audio" : "mic")
+            let stopKey = meeting ? "⇧⌘D" : "⌘D"
+            store.status = meeting ? "Recording meeting (\(sources))… 00:00 — press \(stopKey) to stop" : "Recording… press ⌘D to stop"
+            if let warning { store.status = warning }
             NSSound(named: "Tink")?.play()
             if meeting {
                 activity = ProcessInfo.processInfo.beginActivity(
                     options: [.idleSystemSleepDisabled, .userInitiated], reason: "Recording a meeting")
                 timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-                    guard let self, let r = self.recorder else { return }
-                    self.store.status = "Recording meeting… \(clock(r.currentTime)) — press ⇧⌘D to stop"
+                    guard let self, warning == nil else { return }
+                    self.store.status = "Recording meeting (\(sources))… \(clock(Date().timeIntervalSince(self.startTime))) — press \(stopKey) to stop"
                 }
             }
         } catch {
             store.status = "Could not record: \(error.localizedDescription)"
+            let rec = sysRecorder; sysRecorder = nil
+            Task { await rec?.stop() }
         }
     }
 
     func stopAndTranscribe() {
-        let duration = recorder?.currentTime ?? 0
+        let duration = Date().timeIntervalSince(startTime)
+        recordingActive = false
         recorder?.stop()
         recorder = nil
+        let sysRec = sysRecorder
+        sysRecorder = nil
         timer?.invalidate(); timer = nil
         if let a = activity { ProcessInfo.processInfo.endActivity(a); activity = nil }
         NSSound(named: "Pop")?.play()
@@ -731,7 +763,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.status = meetingMode ? "Transcribing meeting… this can take a few minutes" : "Transcribing…"
         store.spinning = true
         busy = true
-        if meetingMode { Task { await self.processMeeting(duration: duration) }; return }
+        if meetingMode {
+            let mode = capture
+            Task {
+                await sysRec?.stop()
+                let offset = sysRec?.firstBufferAt.map { Float($0.timeIntervalSince(self.micStart)) } ?? 0
+                await self.processMeeting(duration: duration, mode: mode, systemOffset: mode == .both ? offset : 0)
+            }
+            return
+        }
         let detect = store.detectSpeakers
         Task {
             var text = ""
@@ -754,7 +794,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Runs the diarizer over the recording and assigns each transcribed word to a speaker.
-    func diarize(_ words: [(word: String, start: Float, end: Float)], keepSingle: Bool = false) async throws -> [Turn]? {
+    func diarize(_ words: [(word: String, start: Float, end: Float)], file: URL? = nil, keepSingle: Bool = false) async throws -> [Turn]? {
         guard !words.isEmpty else { return nil }
         if diarizer == nil {
             await MainActor.run { self.store.status = "Detecting speakers (first use downloads models)…" }
@@ -764,7 +804,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             await MainActor.run { self.store.status = "Detecting speakers…" }
         }
-        let segs = try await diarizer!.process(fileURL).segments
+        let segs = try await diarizer!.process(file ?? fileURL).segments
         guard !segs.isEmpty else { return nil }
         var order: [String: Int] = [:]
         var turns: [Turn] = []
@@ -782,54 +822,120 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .filter { !$0.text.isEmpty }
     }
 
-    // MARK: Meeting mode
-    func processMeeting(duration: Double) async {
-        var text = ""
-        var turns: [Turn] = []
-        do {
-            let results = try await whisper!.transcribe(
-                audioPath: fileURL.path,
-                decodeOptions: DecodingOptions(wordTimestamps: true, chunkingStrategy: .vad))
-            text = results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-            let words = results.flatMap(\.segments).flatMap { $0.words ?? [] }.filter { !$0.word.hasPrefix("<|") }
-                .map { (word: $0.word, start: $0.start, end: $0.end) }
-            await MainActor.run { self.store.status = "Working out who said what…" }
-            do { turns = try await diarize(words, keepSingle: true) ?? [] } catch { log("diarization failed: \(error)") }
-            if turns.isEmpty && !text.isEmpty { turns = [Turn(speaker: 1, text: text, start: 0)] }
-        } catch {
-            log("meeting transcription failed: \(error)")
+    // MARK: System audio self-test
+    func testSystemAudio() {
+        guard !recordingActive, !starting, !busy else { return }
+        store.status = "Testing system audio — play some sound for 4 seconds…"
+        store.spinning = true
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("system-test.wav")
+        Task {
+            let rec = SystemAudioRecorder()
+            var msg: String
+            do {
+                try await rec.start(to: url)
+                try await Task.sleep(nanoseconds: 4_000_000_000)
+                await rec.stop()
+                let peak = Self.peak(of: url)
+                if rec.firstBufferAt == nil { msg = "✗ System audio started but no audio arrived — play some sound and test again." }
+                else if peak > 0.005 { msg = "✓ System audio works — it heard sound (level \(String(format: "%.2f", peak)))." }
+                else { msg = "System audio is connected but heard silence — play something (music, a video) and test again." }
+            } catch {
+                msg = "✗ System audio blocked — allow Dictaphone in System Settings → Privacy & Security → Screen & System Audio Recording, then relaunch."
+                if !CGPreflightScreenCaptureAccess() {
+                    CGRequestScreenCaptureAccess()
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                }
+                log("system audio test error: \(error)")
+            }
+            try? FileManager.default.removeItem(at: url)
+            log("system audio test: \(msg)")
+            let m = msg
+            await MainActor.run { self.store.status = m; self.store.spinning = false }
         }
-        let t = text, ts = turns
-        await MainActor.run { self.finishMeeting(t, turns: ts, duration: duration) }
     }
 
-    func finishMeeting(_ text: String, turns: [Turn], duration: Double) {
+    static func peak(of url: URL) -> Float {
+        guard let f = try? AVAudioFile(forReading: url), f.length > 0,
+              let buf = AVAudioPCMBuffer(pcmFormat: f.processingFormat, frameCapacity: AVAudioFrameCount(f.length)),
+              (try? f.read(into: buf)) != nil, let ch = buf.floatChannelData?[0] else { return 0 }
+        var p: Float = 0
+        for i in 0..<Int(buf.frameLength) { p = max(p, abs(ch[i])) }
+        return p
+    }
+
+    // MARK: Meeting mode
+    typealias Words = [(word: String, start: Float, end: Float)]
+
+    func transcribeTrack(_ url: URL) async throws -> (text: String, words: Words) {
+        let results = try await whisper!.transcribe(
+            audioPath: url.path, decodeOptions: DecodingOptions(wordTimestamps: true, chunkingStrategy: .vad))
+        let text = results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let words: Words = results.flatMap(\.segments).flatMap { $0.words ?? [] }.filter { !$0.word.hasPrefix("<|") }
+            .map { (word: $0.word, start: $0.start, end: $0.end) }
+        return (text, words)
+    }
+
+    /// Transcribes each recorded track, detects speakers within it, and merges everything by time.
+    /// Mic + system: the mic's loudest voice is "You", other mic voices are "Room N", remote voices are "Remote N".
+    func processMeeting(duration: Double, mode: CaptureMode, systemOffset: Float) async {
+        var all: [Turn] = []
+        var names: [String: String] = [:]
+        var nextID = 1
+        var fullText: [String] = []
+
+        func addTrack(_ url: URL, isSystem: Bool, offset: Float) async {
+            do {
+                let (text, words) = try await transcribeTrack(url)
+                guard !text.isEmpty else { return }
+                await MainActor.run { self.store.status = "Working out who said what…" }
+                var turns: [Turn] = []
+                do { turns = try await diarize(words, file: url, keepSingle: true) ?? [] } catch { log("diarization failed: \(error)") }
+                if turns.isEmpty { turns = [Turn(speaker: 1, text: text, start: words.first?.start ?? 0)] }
+                // rank this track's speakers by how much they said
+                let talk = Dictionary(grouping: turns, by: \.speaker).mapValues { $0.reduce(0) { $0 + $1.text.count } }
+                var ids: [Int: Int] = [:]
+                for (rank, sp) in talk.sorted(by: { $0.value > $1.value }).map(\.key).enumerated() {
+                    ids[sp] = nextID
+                    if isSystem { names[String(nextID)] = "Remote \(rank + 1)" }
+                    else if mode == .both { names[String(nextID)] = rank == 0 ? "You" : "Room \(rank)" }
+                    nextID += 1
+                }
+                for t in turns {
+                    all.append(Turn(speaker: ids[t.speaker]!, text: t.text, start: max((t.start ?? 0) + offset, 0)))
+                }
+                fullText.append(text)
+            } catch {
+                log("meeting transcription failed: \(error)")
+            }
+        }
+
+        if mode != .system { await addTrack(fileURL, isSystem: false, offset: 0) }
+        if mode != .mic { await addTrack(sysURL, isSystem: true, offset: systemOffset) }
+
+        all.sort { ($0.start ?? 0) < ($1.start ?? 0) }
+        var merged: [Turn] = []
+        for t in all {
+            if let l = merged.last, l.speaker == t.speaker { merged[merged.count - 1].text += " " + t.text } else { merged.append(t) }
+        }
+        let text = merged.map(\.text).joined(separator: " ")
+        let result = merged, resultNames = names.isEmpty ? nil : names
+        await MainActor.run { self.finishMeeting(text, turns: result, names: resultNames, duration: duration) }
+    }
+
+    func finishMeeting(_ text: String, turns: [Turn], names: [String: String]?, duration: Double) {
         busy = false
         meetingMode = false
         store.spinning = false
         setIcon("mic", "Ready — press ⌘D")
         try? FileManager.default.removeItem(at: fileURL)
+        try? FileManager.default.removeItem(at: sysURL)
         guard !text.isEmpty else { store.status = "Nothing heard"; return }
         let title = "Meeting — " + Date().formatted(date: .abbreviated, time: .shortened)
-        let t = store.add(text, turns: turns, meeting: MeetingInfo(title: title, duration: duration))
+        let t = store.add(text, turns: turns, meeting: MeetingInfo(title: title, duration: duration), names: names)
         showWindow()
-        store.summarizing.insert(t.id)
-        store.status = "Writing meeting summary…"
-        store.spinning = true
-        let lines = turns.map { "\(t.name($0.speaker)): \($0.text)" }
-        Task {
-            let r = await Summarizer.summarize(lines: lines)
-            await MainActor.run {
-                self.store.applySummary(t.id, r)
-                self.store.summarizing.remove(t.id)
-                self.store.spinning = false
-                if let done = self.store.items.first(where: { $0.id == t.id }) {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(done.markdown, forType: .string)
-                }
-                self.store.status = "Meeting saved — Markdown copied to clipboard"
-            }
-        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(t.markdown, forType: .string)
+        store.status = "Meeting saved — Markdown copied to clipboard"
     }
 
     func finish(_ text: String, turns: [Turn]?) {

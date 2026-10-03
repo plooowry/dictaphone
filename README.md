@@ -16,11 +16,22 @@ Requires an Apple Silicon Mac running macOS 14 or later. Allow microphone access
 | Shortcut | Action |
 |---|---|
 | ⌘D | Start / stop recording and transcribe |
+| ⇧⌘D | Start / stop **meeting mode** (long recording, speakers, timestamps) |
 | ⌥⌘D | Read the latest transcript aloud (press again to stop) |
 
 The window shows each transcript as a card with play, copy and delete buttons. Choose a voice
 (macOS or Kokoro neural), set the speed, turn on auto-read, or "Read all". Transcripts are saved in
 `~/Library/Application Support/Dictaphone/`.
+
+### Meeting mode and video calls
+
+Meeting mode can record the **microphone** (you and the room), the **system audio** (Teams, Zoom, Meet,
+browser calls — works with headphones), or **both**. Each source is transcribed and speaker-detected
+separately, then merged by time: *You*, *Room 2*, *Remote 1*, *Remote 2* … Click any label to rename it.
+System audio needs the **Screen & System Audio Recording** permission (System Settings → Privacy & Security).
+Without headphones, remote voices leak into the mic and may appear twice.
+
+> **Consent:** recording other people may require their consent where you live. Let participants know.
 
 Note: ⌘D is registered globally, so it overrides "Bookmark" shortcuts in other apps while Dictaphone runs.
 Edit the key in `registerHotKeys()` if you prefer another.
