@@ -6,14 +6,9 @@ back to you with macOS voices or natural-sounding on-device neural voices (Kokor
 
 Everything runs locally. No account, no cloud, no API keys.
 
-## Download
+## Requirements
 
-1. Grab **Dictaphone-macOS.zip** from the [Releases](../../releases) page and unzip it.
-2. Drag **Dictaphone.app** into your Applications folder.
-3. The app isn't notarized, so the first time **right-click → Open** (or run
-   `xattr -cr /Applications/Dictaphone.app`), then allow microphone access.
-
-Requires an Apple Silicon Mac running macOS 14 or later. The first launch downloads the Whisper
+Requires an Apple Silicon Mac running macOS 14 or later. Allow microphone access when prompted. The first launch downloads the Whisper
 `base.en` speech model (~150 MB); the first use of a neural voice downloads ~350 MB.
 
 ## Use
@@ -35,7 +30,7 @@ Edit the key in `registerHotKeys()` if you prefer another.
 Needs Xcode (Swift 5.9+).
 
 ```bash
-./build.sh          # builds Dictaphone.app and dist/Dictaphone-macOS.zip
+./build.sh          # builds Dictaphone.app
 open Dictaphone.app
 ```
 
